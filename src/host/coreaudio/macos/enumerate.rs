@@ -26,26 +26,44 @@ unsafe fn audio_devices() -> Result<Vec<AudioDeviceID>, OSStatus> {
         };
     }
 
-    let data_size = 0u32;
+    // `AudioObjectGetPropertyDataSize` writes the required byte size back into
+    // this variable.  It **must** therefore be mutable; passing a pointer
+    // derived from an immutable reference triggers undefined behaviour (Core
+    // Audio mutates data behind the compiler's back).  See the discussion in
+    // <https://github.com/RustAudio/cpal/issues/768> for details.
+    let mut data_size: u32 = 0;
     let status = AudioObjectGetPropertyDataSize(
         kAudioObjectSystemObject as AudioObjectID,
         NonNull::from(&property_address),
         0,
         null(),
-        NonNull::from(&data_size),
+        NonNull::from(&mut data_size),
     );
     try_status_or_return!(status);
 
     let device_count = data_size / mem::size_of::<AudioDeviceID>() as u32;
-    let mut audio_devices = vec![];
-    audio_devices.reserve_exact(device_count as usize);
+
+    // A zero-sized query is legal and indicates that no audio devices are
+    // currently present (for example, a headless Continuous Integration
+    // machine).  If we continued and passed `audio_devices.as_mut_ptr()` to
+    // Core Audio, we would hand it a dangling (non-NULL) pointer of length 0 –
+    // technically UB and liable to crash if dereferenced.  Instead, return an
+    // empty vector early.
+    if device_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Pre-allocate the exact capacity we need so that we can write directly
+    // into the backing buffer without any reallocations while still keeping a
+    // valid pointer for Core Audio.
+    let mut audio_devices = Vec::with_capacity(device_count as usize);
 
     let status = AudioObjectGetPropertyData(
         kAudioObjectSystemObject as AudioObjectID,
         NonNull::from(&property_address),
         0,
         null(),
-        NonNull::from(&data_size),
+        NonNull::from(&mut data_size),
         NonNull::new(audio_devices.as_mut_ptr()).unwrap().cast(),
     );
     try_status_or_return!(status);
@@ -94,14 +112,16 @@ pub fn default_input_device() -> Option<Device> {
     };
 
     let mut audio_device_id: AudioDeviceID = 0;
-    let data_size = mem::size_of::<AudioDeviceID>() as u32;
+    // The getter below also writes `data_size` back, so it needs to be mutable
+    // for the same reason described earlier.
+    let mut data_size = mem::size_of::<AudioDeviceID>() as u32;
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,
             NonNull::from(&property_address),
             0,
             null(),
-            NonNull::from(&data_size),
+            NonNull::from(&mut data_size),
             NonNull::from(&mut audio_device_id).cast(),
         )
     };
@@ -126,14 +146,15 @@ pub fn default_output_device() -> Option<Device> {
     };
 
     let mut audio_device_id: AudioDeviceID = 0;
-    let data_size = mem::size_of::<AudioDeviceID>() as u32;
+    // Mutable for the same reason – Core Audio may update the value.
+    let mut data_size = mem::size_of::<AudioDeviceID>() as u32;
     let status = unsafe {
         AudioObjectGetPropertyData(
             kAudioObjectSystemObject as AudioObjectID,
             NonNull::from(&property_address),
             0,
             null(),
-            NonNull::from(&data_size),
+            NonNull::from(&mut data_size),
             NonNull::from(&mut audio_device_id).cast(),
         )
     };
