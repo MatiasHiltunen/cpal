@@ -25,8 +25,8 @@ pub use self::macos::{
     Device, Host, Stream,
 };
 
+// Fix for clippy warning `empty_line_after_doc_comments` by removing a newline.
 /// Common helper methods used by both macOS and iOS
-
 fn check_os_status(os_status: OSStatus) -> Result<(), BackendSpecificError> {
     match coreaudio::Error::from_os_status(os_status) {
         Ok(()) => Ok(()),

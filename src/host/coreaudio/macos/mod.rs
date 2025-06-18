@@ -421,6 +421,20 @@ struct StreamInner {
     device_id: AudioDeviceID,
 }
 
+// Fix for linting error by adding this unsafe impl.
+// `StreamInner` is not `Send` by default because it contains `AudioUnit` and
+// `AudioObjectPropertyListener` types that are thin wrappers around raw pointers.
+//
+// The `AudioUnit` is only ever accessed via `&mut self` on the `StreamInner`, and the
+// `StreamInner` is stored within a `Mutex`. This guarantees that only one thread
+// can access the `AudioUnit` at a time. The underlying `kAudioOutputUnitProperty_CurrentDevice`
+// and `kAudioOutputUnitProperty_EnableIO` properties are thread-safe.
+//
+// The `AudioObjectPropertyListener` is created and its callback is registered on stream
+// creation, and it is only unregistered on drop. The `Mutex` ensures that the `StreamInner`
+// cannot be dropped while another thread is accessing it.
+unsafe impl Send for StreamInner {}
+
 impl StreamInner {
     fn play(&mut self) -> Result<(), PlayStreamError> {
         if !self.playing {

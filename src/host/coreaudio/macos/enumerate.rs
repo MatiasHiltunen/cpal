@@ -20,7 +20,7 @@ unsafe fn audio_devices() -> Result<Vec<AudioDeviceID>, OSStatus> {
 
     macro_rules! try_status_or_return {
         ($status:expr) => {
-            if $status != kAudioHardwareNoError as i32 {
+            if $status != kAudioHardwareNoError {
                 return Err($status);
             }
         };
@@ -105,7 +105,9 @@ pub fn default_input_device() -> Option<Device> {
             NonNull::from(&mut audio_device_id).cast(),
         )
     };
-    if status != kAudioHardwareNoError as i32 {
+    // Fix for clippy warning `unnecessary_cast`.
+    // The `kAudioHardwareNoError` constant is of type `OSStatus` (i32), so casting it is unnecessary.
+    if status != kAudioHardwareNoError {
         return None;
     }
 
@@ -135,7 +137,9 @@ pub fn default_output_device() -> Option<Device> {
             NonNull::from(&mut audio_device_id).cast(),
         )
     };
-    if status != kAudioHardwareNoError as i32 {
+    // Fix for clippy warning `unnecessary_cast`.
+    // The `kAudioHardwareNoError` constant is of type `OSStatus` (i32), so casting it is unnecessary.
+    if status != kAudioHardwareNoError {
         return None;
     }
 
