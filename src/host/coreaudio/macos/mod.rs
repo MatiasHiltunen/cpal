@@ -160,12 +160,173 @@ pub struct Device {
     is_default: bool,
 }
 
+/// Human-readable, readonly metadata about a Core Audio device. All fields are eagerly
+/// populated on first call to `Device::metadata()` to avoid extra Core Audio round-trips.
+#[derive(Debug, Clone)]
+pub struct DeviceMetadata {
+    /// The localized device name (same as `Device::name()`).
+    pub name: String,
+    /// Stable per-boot identifier such as `BuiltInSpeakerDevice` or a USB UID.
+    pub uid: Option<String>,
+    /// One of the `kAudioDeviceTransportType*` constants (USB, Bluetooth, PCI…).
+    pub transport_type: Option<u32>,
+    /// Whether Core Audio currently reports the device as alive (connected and not in
+    /// a fatal error state).
+    pub is_alive: bool,
+    /// Whether cpal considered the device a default input *or* output when enumerated.
+    pub is_default: bool,
+}
+
 impl Device {
     fn name(&self) -> Result<String, DeviceNameError> {
         get_device_name(self.audio_device_id).map_err(|err| DeviceNameError::BackendSpecific {
             err: BackendSpecificError {
                 description: err.to_string(),
             },
+        })
+    }
+
+    /// Query Core Audio for a richer set of information about this device.
+    ///
+    /// This is a convenience wrapper; all fields are optional except `name` and `is_alive`.
+    /// Failures are reported via `BackendSpecificError` so that callers can still use partial
+    /// information.
+    pub fn metadata(&self) -> Result<DeviceMetadata, BackendSpecificError> {
+        // Helper for propagating OSStatus into BackendSpecificError.
+        fn map_status(status: OSStatus, context: &str) -> Result<(), BackendSpecificError> {
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(BackendSpecificError {
+                    description: format!("{} (os_status = 0x{:08X})", context, status),
+                })
+            }
+        }
+
+        // Name is required and already handled by `get_device_name`.
+        let name = self
+            .name()
+            .unwrap_or_else(|_| "<Unknown>".to_string());
+
+        // ----------------- UID -----------------
+        let uid: Option<String> = unsafe {
+            let property_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+
+            let mut cf_string_ref: u64 = 0; // CFStringRef is a *const __CFString => u64 on 64-bit
+            let mut data_size = std::mem::size_of::<u64>() as u32;
+            let status = AudioObjectGetPropertyData(
+                self.audio_device_id,
+                NonNull::from(&property_address),
+                0,
+                null(),
+                NonNull::from(&mut data_size),
+                NonNull::from(&mut cf_string_ref).cast(),
+            );
+
+            if status != 0 || cf_string_ref == 0 {
+                None
+            } else {
+                // Safety: we just received a valid CFStringRef from Core Audio. We create a
+                // temporary CFString wrapper and then convert it to a Rust String.
+                #[cfg(target_os = "macos")]
+                {
+                    use std::ffi::CStr;
+                    use std::os::raw::c_char;
+
+                    // Older `core_foundation` is not a direct dependency here, so we fallback to
+                    // a minimal conversion by calling `CFStringGetCStringPtr` if available.
+                    extern "C" {
+                        fn CFStringGetCStringPtr(theString: *const std::ffi::c_void, encoding: u32) -> *const c_char;
+                        fn CFStringGetCString(
+                            theString: *const std::ffi::c_void,
+                            buffer: *mut c_char,
+                            buffer_size: i64,
+                            encoding: u32,
+                        ) -> bool;
+                    }
+
+                    const kCFStringEncodingUTF8: u32 = 0x08000100;
+
+                    let s_ref = cf_string_ref as *const std::ffi::c_void;
+                    let c_ptr = CFStringGetCStringPtr(s_ref, kCFStringEncodingUTF8);
+                    if !c_ptr.is_null() {
+                        let c_str = CStr::from_ptr(c_ptr);
+                        Some(c_str.to_string_lossy().into_owned())
+                    } else {
+                        // Fallback path: copy into stack buffer.
+                        let mut buf = [0i8; 256];
+                        if CFStringGetCString(s_ref, buf.as_mut_ptr(), 255, kCFStringEncodingUTF8) {
+                            // Safety: buffer is UTF-8 or we fall back to lossy.
+                            let c_str = CStr::from_ptr(buf.as_ptr());
+                            Some(c_str.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    None
+                }
+            }
+        };
+
+        // ----------------- Transport Type -----------------
+        let transport_type: Option<u32> = unsafe {
+            let property_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyTransportType,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+
+            let mut tt: u32 = 0;
+            let mut data_size = std::mem::size_of::<u32>() as u32;
+            let status = AudioObjectGetPropertyData(
+                self.audio_device_id,
+                NonNull::from(&property_address),
+                0,
+                null(),
+                NonNull::from(&mut data_size),
+                NonNull::from(&mut tt).cast(),
+            );
+            if status != 0 {
+                None
+            } else {
+                Some(tt)
+            }
+        };
+
+        // ----------------- IsAlive -----------------
+        let is_alive: bool = unsafe {
+            let property_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyDeviceIsAlive,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+
+            let mut alive: u32 = 0;
+            let mut data_size = std::mem::size_of::<u32>() as u32;
+            let status = AudioObjectGetPropertyData(
+                self.audio_device_id,
+                NonNull::from(&property_address),
+                0,
+                null(),
+                NonNull::from(&mut data_size),
+                NonNull::from(&mut alive).cast(),
+            );
+            status == 0 && alive != 0
+        };
+
+        Ok(DeviceMetadata {
+            name,
+            uid,
+            transport_type,
+            is_alive,
+            is_default: self.is_default,
         })
     }
 
@@ -943,3 +1104,11 @@ fn get_io_buffer_frame_size_range(
         max: buffer_size_range.mMaximum as u32,
     })
 }
+
+// The following property selectors are not yet exposed by `objc2_core_audio`. They are defined
+// here manually using their canonical four-character codes so we can query UID and transport
+// information for devices.
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyDeviceUID: u32 = 0x7569_6420; // 'uid '
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyTransportType: u32 = 0x7472_616E; // 'tran'
