@@ -1,5 +1,6 @@
 //! Helper code for registering audio object property listeners.
 use std::ptr::NonNull;
+use std::panic::{self, AssertUnwindSafe};
 
 use objc2_core_audio::{
     AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
@@ -11,7 +12,7 @@ use crate::BuildStreamError;
 
 /// A double-indirection to be able to pass a closure (a fat pointer)
 /// via a single c_void.
-struct PropertyListenerCallbackWrapper(Box<dyn FnMut()>);
+struct PropertyListenerCallbackWrapper(Box<dyn FnMut() + Send>);
 
 /// Maintain an audio object property listener.
 /// The listener will be removed when this type is dropped.
@@ -24,22 +25,28 @@ pub struct AudioObjectPropertyListener {
 
 impl AudioObjectPropertyListener {
     /// Attach the provided callback as a audio object property listener.
-    pub fn new<F: FnMut() + 'static>(
+    pub fn new<F: FnMut() + Send + 'static>(
         audio_object_id: AudioObjectID,
         property_address: AudioObjectPropertyAddress,
         callback: F,
     ) -> Result<Self, BuildStreamError> {
-        let callback = Box::new(PropertyListenerCallbackWrapper(Box::new(callback)));
+        // Allocate the wrapper but keep ownership until we've successfully registered.
+        let mut callback_box = Box::new(PropertyListenerCallbackWrapper(Box::new(callback)));
+
+        // Stable pointer passed to Core Audio.
+        let cb_ptr = &mut *callback_box as *mut _ as *mut _;
+
         unsafe {
             coreaudio::Error::from_os_status(AudioObjectAddPropertyListener(
                 audio_object_id,
                 NonNull::from(&property_address),
                 Some(property_listener_handler_shim),
-                &*callback as *const _ as *mut _,
+                cb_ptr,
             ))?;
         };
+
         Ok(Self {
-            callback,
+            callback: callback_box,
             audio_object_id,
             property_address,
             removed: false,
@@ -82,7 +89,12 @@ unsafe extern "C-unwind" fn property_listener_handler_shim(
     _: NonNull<AudioObjectPropertyAddress>,
     callback: *mut ::std::os::raw::c_void,
 ) -> OSStatus {
-    let wrapper = callback as *mut PropertyListenerCallbackWrapper;
-    (*wrapper).0();
+    let wrapper = &mut *(callback as *mut PropertyListenerCallbackWrapper);
+
+    // Catch panics so they don't unwind across the FFI boundary (which would abort).
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+        (wrapper.0)();
+    }));
+
     0
 }

@@ -4,3 +4,5 @@
 .DS_Store
 recorded.wav
 rls*.log
+target
+build
