@@ -18,8 +18,16 @@ const FFT_SIZE: usize = 1024;
 const HISTORY: usize = 180; // rows
 const REFRESH_MS: u64 = 10; // redraw & input poll interval
 const ROW_INTERVAL_MS: u64 = 48; // push a new spectrogram row every 200 ms
-const HIGH_FREQ_BOOST: f32 = 3.0; // up to ×(1+HIGH_FREQ_BOOST) gain at highest bin
+const HIGH_FREQ_BOOST: f32 = 1.5; // up to ×(1+HIGH_FREQ_BOOST) gain at highest bin
 
+// With WASAPI on Windows, RAW (unprocessed) mode can be requested by setting the environment variable
+// `CPAL_WASAPI_REQUEST_FORCE_RAW=1`. When enabled, we ask the driver to bypass pre-processing such
+// as AGC or noise suppression. So far no other hosts have been tested with this.
+// Spectrogram demonstrates quite nicely the difference between true raw and the AGC or noise suppression.
+//
+// Windows cmd / PowerShell:
+//  set CPAL_WASAPI_REQUEST_FORCE_RAW=1
+//  cargo run --example visualize_spectrogram
 fn main() -> anyhow::Result<()> {
     // Setup terminal
     terminal::enable_raw_mode()?;
@@ -89,7 +97,7 @@ fn main() -> anyhow::Result<()> {
                     row[i] = avg * weight;
                 }
                 // normalize row 0..1 logarithmic
-                let max_mag = row.iter().cloned().fold(0./0., f32::max).max(1e-6);
+                let _max_mag = row.iter().cloned().fold(0./0., f32::max).max(1e-6);
                 for v in &mut row {
                     *v = (v.log10().max(-5.0)+5.0)/5.0; // 0..1
                 }
