@@ -1,0 +1,10 @@
+[package]
+name = "visualize_spectrogram_cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+cpal = { path = "../../" }
+crossterm = "0.29.0"
+rustfft = "6" 

@@ -17,8 +17,8 @@ use rustfft::{num_complex::Complex, FftPlanner};
 const FFT_SIZE: usize = 1024;
 const HISTORY: usize = 180; // rows
 const REFRESH_MS: u64 = 10; // redraw & input poll interval
-const ROW_INTERVAL_MS: u64 = 48; // push a new spectrogram row every 200 ms
-const HIGH_FREQ_BOOST: f32 = 1.5; // up to ×(1+HIGH_FREQ_BOOST) gain at highest bin
+const ROW_INTERVAL_MS: u64 = 48; // push a new spectrogram row
+const HIGH_FREQ_BOOST: f32 = 1.0; // up to ×(1+HIGH_FREQ_BOOST) gain at highest bin
 
 // With WASAPI on Windows, RAW (unprocessed) mode can be requested by setting the environment variable
 // `CPAL_WASAPI_REQUEST_FORCE_RAW=1`. When enabled, we ask the driver to bypass pre-processing such
@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     let host = cpal::default_host();
     let device = host.default_input_device().expect("No input device");
     let supported = device.default_input_config()?;
-    let mut cfg: StreamConfig = supported.clone().into();
+    let cfg: StreamConfig = supported.clone().into();
 
     let (tx, rx) = mpsc::channel::<f32>();
     let sample_format = supported.sample_format();
