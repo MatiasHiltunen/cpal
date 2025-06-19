@@ -5,10 +5,10 @@
 //
 // Windows cmd:
 //  set CPAL_WASAPI_REQUEST_FORCE_RAW=1
-//  cargo run --example visualize_spectrogram
+//  cargo run --manifest-path examples/visualize_spectrogram_cli/Cargo.toml
 //
 // PowerShell:
-//  $env:CPAL_WASAPI_REQUEST_FORCE_RAW=1; cargo run --example visualize_spectrogram
+//  $env:CPAL_WASAPI_REQUEST_FORCE_RAW=1; cargo run --manifest-path examples/visualize_spectrogram_cli/Cargo.toml
 
 
 use std::io::{self, Write};
