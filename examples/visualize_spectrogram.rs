@@ -25,9 +25,14 @@ const HIGH_FREQ_BOOST: f32 = 1.5; // up to ×(1+HIGH_FREQ_BOOST) gain at highest
 // as AGC or noise suppression. So far no other hosts have been tested with this.
 // Spectrogram demonstrates quite nicely the difference between true raw and the AGC or noise suppression.
 //
-// Windows cmd / PowerShell:
+// Windows cmd:
 //  set CPAL_WASAPI_REQUEST_FORCE_RAW=1
 //  cargo run --example visualize_spectrogram
+//
+// PowerShell:
+//  $env:CPAL_WASAPI_REQUEST_FORCE_RAW=1; cargo run --example visualize_spectrogram
+
+
 fn main() -> anyhow::Result<()> {
     // Setup terminal
     terminal::enable_raw_mode()?;
