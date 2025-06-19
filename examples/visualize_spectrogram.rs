@@ -9,15 +9,16 @@ use crossterm::{event, execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
-use ratatui::text::{Span, Spans};
+use ratatui::text::{Span, Line};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Terminal;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 const FFT_SIZE: usize = 1024;
-const BINS: usize = 64;   // columns
-const HISTORY: usize = 60; // rows
-const REFRESH_MS: u64 = 80;
+const HISTORY: usize = 180; // rows
+const REFRESH_MS: u64 = 10; // redraw & input poll interval
+const ROW_INTERVAL_MS: u64 = 48; // push a new spectrogram row every 200 ms
+const HIGH_FREQ_BOOST: f32 = 3.0; // up to ×(1+HIGH_FREQ_BOOST) gain at highest bin
 
 fn main() -> anyhow::Result<()> {
     // Setup terminal
@@ -43,8 +44,15 @@ fn main() -> anyhow::Result<()> {
     let mut pos = 0usize;
     let mut history: Vec<Vec<f32>> = Vec::with_capacity(HISTORY);
 
-    let bin_hz = supported.sample_rate().0 as f32 / FFT_SIZE as f32;
-    let step = (FFT_SIZE / 2) / BINS;
+    // Determine initial bin count from terminal width
+    let mut bins = {
+        let sz = terminal.size()?;
+        usize::max(sz.width as usize, 1)
+    };
+
+    // Accumulate the maximum magnitude observed for each bin over a ROW_INTERVAL_MS window
+    let mut interval_row = vec![0f32; bins];
+    let mut last_row_time = Instant::now();
 
     loop {
         // Collect samples
@@ -56,22 +64,50 @@ fn main() -> anyhow::Result<()> {
                 let mut complex: Vec<Complex<f32>> = buf.iter().map(|&v| Complex{re:v, im:0.0}).collect();
                 fft.process(&mut complex);
                 let magnitudes: Vec<f32> = complex.iter().take(FFT_SIZE/2).map(|c| c.norm()).collect();
+                // adapt bin count to current terminal width if it changed
+                let new_bins = {
+                    let sz = terminal.size()?;
+                    usize::max(sz.width as usize, 1)
+                };
+                if new_bins != bins {
+                    bins = new_bins;
+                    interval_row = vec![0f32; bins];
+                    history.clear();
+                }
+
                 // compress bins
-                let mut row = vec![0f32; BINS];
-                for i in 0..BINS {
-                    let slice = &magnitudes[i*step..(i+1)*step];
+                let mut row = vec![0f32; bins];
+                let step = usize::max(magnitudes.len() / bins, 1);
+                for i in 0..bins {
+                    let start = i*step;
+                    if start >= magnitudes.len() { break; }
+                    let end = ((i+1)*step).min(magnitudes.len());
+                    let slice = &magnitudes[start..end];
                     let avg = slice.iter().sum::<f32>() / slice.len() as f32;
-                    row[i] = avg;
+                    // Apply frequency-dependent gain: low bins ≈ 1×, highest bin ≈ 1+HIGH_FREQ_BOOST×
+                    let weight = 1.0 + HIGH_FREQ_BOOST * (i as f32) / (bins.max(1) as f32 - 1.0);
+                    row[i] = avg * weight;
                 }
                 // normalize row 0..1 logarithmic
                 let max_mag = row.iter().cloned().fold(0./0., f32::max).max(1e-6);
                 for v in &mut row {
                     *v = (v.log10().max(-5.0)+5.0)/5.0; // 0..1
                 }
-                if history.len() == HISTORY {
-                    history.remove(0);
+
+                // update per-second maxima
+                for i in 0..bins {
+                    interval_row[i] = interval_row[i].max(row[i]);
                 }
-                history.push(row);
+
+                // every ROW_INTERVAL_MS, commit a row built from the maxima (or immediately if empty)
+                if last_row_time.elapsed() >= Duration::from_millis(ROW_INTERVAL_MS) || history.is_empty() {
+                    if history.len() == HISTORY {
+                        history.remove(0);
+                    }
+                    history.push(interval_row.clone());
+                    interval_row.fill(0.0);
+                    last_row_time = Instant::now();
+                }
                 pos = 0;
             }
         }
@@ -82,19 +118,18 @@ fn main() -> anyhow::Result<()> {
             let chunks = Layout::default().constraints([Constraint::Percentage(100)].as_ref()).split(size);
 
             // Build lines
-            let mut lines: Vec<Spans> = Vec::new();
+            let mut lines: Vec<Line> = Vec::new();
             for row in history.iter().rev() { // newest at bottom
-                let mut spans: Vec<Span> = Vec::with_capacity(BINS);
+                let mut spans: Vec<Span> = Vec::with_capacity(row.len());
                 for &v in row {
                     spans.push(Span::styled("█", Style::default().fg(color_for(v))));
                 }
-                lines.push(Spans::from(spans));
+                lines.push(Line::from(spans));
             }
             // pad empty
             while lines.len()<HISTORY {
-                lines.push(Spans::from(""));
+                lines.push(Line::from(""));
             }
-            lines.reverse();
 
             let para = Paragraph::new(lines).block(Block::default().title("Spectrogram (q to quit)"));
             f.render_widget(para, chunks[0]);
@@ -125,10 +160,21 @@ fn build_stream(device: &cpal::Device, cfg:&StreamConfig, fmt:SampleFormat, tx:m
 }
 
 fn color_for(v: f32) -> Color {
-    // v in 0..1 => map to purple (low) to white (high)
-    let v = v.clamp(0.0,1.0);
-    let r = (191.0 + v*64.0) as u8; // 191..255
-    let g = (0.0 + v*64.0) as u8;   // 0..64
-    let b = (191.0 + v*64.0) as u8; // 191..255 (purple tint)
-    Color::Rgb(r,g,b)
+    // Map 0 → black, 0.5 → purple, 1 → white using a two-segment gradient.
+    let v = v.clamp(0.0, 1.0);
+    if v < 0.5 {
+        // Black → Purple
+        let t = v * 2.0; // 0..1
+        let r = (255.0 * 0.5 * t) as u8; // 0..127
+        let g = 0u8;
+        let b = (255.0 * 0.5 * t) as u8; // 0..127
+        Color::Rgb(r, g, b)
+    } else {
+        // Purple → White
+        let t = (v - 0.5) * 2.0; // 0..1
+        let r = (127.0 + 128.0 * t) as u8; // 127..255
+        let g = (0.0 + 255.0 * t) as u8;   // 0..255
+        let b = (127.0 + 128.0 * t) as u8; // 127..255
+        Color::Rgb(r, g, b)
+    }
 } 
