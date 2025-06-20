@@ -131,8 +131,19 @@ mod terminal {
                     fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
                 }
                 
-                // Reset to default mode
-                SetConsoleMode(handle as *mut _, 0x0002 | 0x0004); // LINE_INPUT | ECHO_INPUT
+                // Reset to a reasonable default INPUT mode.
+                // Windows consoles usually start with:
+                //   ENABLE_PROCESSED_INPUT (0x0001) – translates Ctrl+C / Ctrl+Break
+                //   ENABLE_LINE_INPUT      (0x0002)
+                //   ENABLE_ECHO_INPUT      (0x0004)
+                // Previously we restored only 0x0002 | 0x0004 and *dropped*
+                // PROCESSED_INPUT, which prevented the console from generating
+                // control events the next time the program ran (hence Ctrl+C /
+                // Ctrl+Z worked only once per terminal).  Re-enable bit 0x0001.
+                const PROCESSED_INPUT: u32 = 0x0001;
+                const LINE_INPUT: u32 = 0x0002;
+                const ECHO_INPUT: u32 = 0x0004;
+                SetConsoleMode(handle as *mut _, PROCESSED_INPUT | LINE_INPUT | ECHO_INPUT);
             }
         }
         
