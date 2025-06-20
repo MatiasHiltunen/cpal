@@ -601,13 +601,18 @@ impl SpectrogramDisplay {
         if terminal_height != self.current_height && terminal_height > 0 {
             self.current_height = terminal_height;
             // Adjust max_rows to fit terminal (leave space for header)
-            let available_rows = terminal_height.saturating_sub(3); // 3 lines for header
+          /*   let available_rows = terminal_height.saturating_sub(3); // 3 lines for header
             if available_rows < self.max_rows {
                 self.max_rows = available_rows.max(1);
                 // Trim history if needed
                 while self.history.len() > self.max_rows {
                     self.history.remove(0);
                 }
+            } */
+            let available_rows = terminal_height.saturating_sub(3).max(1);
+            self.max_rows = available_rows;              // grow or shrink
+            if self.history.len() > self.max_rows {      // trim only when necessary
+                self.history.drain(..self.history.len() - self.max_rows);
             }
         }
         
