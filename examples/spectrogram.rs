@@ -19,11 +19,15 @@ use std::f32::consts::PI;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
+
+// Global shutdown signal
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 // Configuration constants
 mod config {
@@ -54,13 +58,13 @@ mod config {
 /// Cross-platform terminal control using ANSI escape sequences
 mod terminal {
     use std::io;
+    #[cfg(unix)]
+    use std::io::Read;
 
     /// Enable raw mode (platform-specific)
     pub fn enable_raw_mode() -> io::Result<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::io::AsRawFd;
-            
             unsafe {
                 let mut termios: libc::termios = std::mem::zeroed();
                 libc::tcgetattr(libc::STDIN_FILENO, &mut termios);
@@ -274,17 +278,12 @@ mod terminal {
     }
 
     /// ANSI escape sequences
-    pub const CLEAR_SCREEN: &str = "\x1b[2J";
     pub const CURSOR_HOME: &str = "\x1b[H";
     pub const HIDE_CURSOR: &str = "\x1b[?25l";
     pub const SHOW_CURSOR: &str = "\x1b[?25h";
     pub const ALTERNATE_SCREEN: &str = "\x1b[?1049h";
     pub const NORMAL_SCREEN: &str = "\x1b[?1049l";
     pub const RESET_COLOR: &str = "\x1b[0m";
-    
-    pub fn move_cursor(x: u16, y: u16) -> String {
-        format!("\x1b[{};{}H", y + 1, x + 1)
-    }
     
     pub fn set_color(r: u8, g: u8, b: u8) -> String {
         format!("\x1b[38;2;{};{};{}m", r, g, b)
@@ -525,6 +524,7 @@ struct SpectrogramDisplay {
     history: Vec<Vec<f32>>,
     max_rows: usize,
     current_bins: usize,
+    current_height: usize,
     interval_maximums: Vec<f32>,
     last_row_time: Instant,
 }
@@ -535,14 +535,29 @@ impl SpectrogramDisplay {
             history: Vec::with_capacity(max_rows),
             max_rows,
             current_bins: initial_width.max(1),
+            current_height: 24, // Default terminal height
             interval_maximums: vec![0.0; initial_width.max(1)],
             last_row_time: Instant::now(),
         }
     }
     
-    fn update(&mut self, magnitudes: &[f32], terminal_width: usize) -> bool {
+    fn update(&mut self, magnitudes: &[f32], terminal_width: usize, terminal_height: usize) -> bool {
+        // Update dimensions if changed
         if terminal_width != self.current_bins && terminal_width > 0 {
             self.resize(terminal_width);
+        }
+        
+        if terminal_height != self.current_height && terminal_height > 0 {
+            self.current_height = terminal_height;
+            // Adjust max_rows to fit terminal (leave space for header)
+            let available_rows = terminal_height.saturating_sub(3); // 3 lines for header
+            if available_rows < self.max_rows {
+                self.max_rows = available_rows.max(1);
+                // Trim history if needed
+                while self.history.len() > self.max_rows {
+                    self.history.remove(0);
+                }
+            }
         }
         
         let binned = self.bin_frequencies(magnitudes);
@@ -620,23 +635,42 @@ impl SpectrogramDisplay {
     fn render(&self) -> String {
         let mut output = String::new();
         
-        // Clear screen and move to home
-        output.push_str(terminal::CLEAR_SCREEN);
+        // Move cursor to home position (no clear needed - we'll overwrite everything)
         output.push_str(terminal::CURSOR_HOME);
         
-        // Title
-        output.push_str("Audio Spectrogram (Press 'q' or ESC to quit)\r\n");
-        output.push_str(&"-".repeat(self.current_bins.min(80)));
+        // Title line 1
+        output.push_str("Audio Spectrogram (Press CTRL+C to quit)");
+        output.push_str("\x1b[0K"); // Clear to end of line
         output.push_str("\r\n");
         
+        // Title line 2 - separator
+        let separator_width = self.current_bins.min(self.current_height.saturating_mul(3));
+        output.push_str(&"-".repeat(separator_width));
+        output.push_str("\x1b[0K"); // Clear to end of line
+        output.push_str("\r\n");
+        
+        // Calculate available rows for spectrogram
+        let available_rows = self.current_height.saturating_sub(3); // 2 for header + 1 for safety
+        let rows_to_render = self.history.len().min(available_rows);
+        
         // Render spectrogram rows (newest at bottom)
-        for row in self.history.iter().rev() {
-            for &value in row.iter() {
+        let start_idx = self.history.len().saturating_sub(rows_to_render);
+        for row in self.history[start_idx..].iter() {
+            // Ensure we don't exceed terminal width
+            let cols_to_render = row.len().min(self.current_bins);
+            for &value in row[..cols_to_render].iter() {
                 let (r, g, b) = value_to_rgb(value);
                 output.push_str(&terminal::set_color(r, g, b));
                 output.push('█');
             }
             output.push_str(terminal::RESET_COLOR);
+            output.push_str("\x1b[0K"); // Clear to end of line
+            output.push_str("\r\n");
+        }
+        
+        // Clear any remaining lines if terminal grew
+        for _ in rows_to_render..available_rows {
+            output.push_str("\x1b[0K"); // Clear entire line
             output.push_str("\r\n");
         }
         
@@ -705,9 +739,13 @@ impl SpectrogramApp {
         let audio_capture = AudioCapture::new()?;
         let fft_analyzer = FftAnalyzer::new(config::FFT_SIZE);
         
-        let (width, _) = terminal::size()?;
+        let (width, height) = terminal::size()?;
+        // Adjust history rows based on terminal height
+        let available_rows = height.saturating_sub(3) as usize; // Leave space for header
+        let history_rows = config::HISTORY_ROWS.min(available_rows.max(5)); // At least 5 rows
+        
         let display = Arc::new(Mutex::new(SpectrogramDisplay::new(
-            config::HISTORY_ROWS,
+            history_rows,
             width as usize,
         )));
         
@@ -725,20 +763,29 @@ impl SpectrogramApp {
         let mut last_render = Instant::now();
         
         loop {
+            // Check for shutdown signal
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                break;
+            }
+            
             // Process audio samples
             while let Ok(sample) = self.audio_capture.try_recv() {
                 if let Some(magnitudes) = self.fft_analyzer.add_sample(sample) {
-                    let (width, _) = terminal::size()?;
+                    let (width, height) = terminal::size()?;
                     
                     let mut display = self.display.lock().unwrap();
-                    display.update(&magnitudes, width as usize);
+                    display.update(&magnitudes, width as usize, height as usize);
                 }
             }
             
             // Render at refresh interval
             if last_render.elapsed() >= config::REFRESH_INTERVAL {
                 let display = self.display.lock().unwrap();
-                print!("{}", display.render());
+                let output = display.render();
+                drop(display); // Release lock before I/O
+                
+                // Write in one go for atomic update
+                print!("{}", output);
                 io::stdout().flush()?;
                 last_render = Instant::now();
             }
@@ -759,6 +806,46 @@ impl SpectrogramApp {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Set up Ctrl+C handler
+    #[cfg(unix)]
+    {
+        unsafe {
+            // Simple signal handler for SIGINT
+            extern "C" fn handle_sigint(_: libc::c_int) {
+                SHUTDOWN.store(true, Ordering::SeqCst);
+            }
+            
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handle_sigint as libc::sighandler_t;
+            libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        }
+    }
+    
+    #[cfg(windows)]
+    {
+        unsafe {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn SetConsoleCtrlHandler(
+                    handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                    add: i32
+                ) -> i32;
+            }
+            
+            unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
+                match ctrl_type {
+                    0 | 1 => { // CTRL_C_EVENT or CTRL_BREAK_EVENT
+                        SHUTDOWN.store(true, Ordering::SeqCst);
+                        1 // Handled
+                    }
+                    _ => 0, // Not handled
+                }
+            }
+            
+            SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+        }
+    }
+
     // Print environment variable hint for Windows users
     #[cfg(target_os = "windows")]
     {
