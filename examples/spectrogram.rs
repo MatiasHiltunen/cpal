@@ -13,7 +13,9 @@
 //! ```
 //!
 //! ## Environment Variables
-//! - `CPAL_WASAPI_REQUEST_FORCE_RAW=1` - On Windows, request raw (unprocessed) audio input
+//! `CPAL_WASAPI_REQUEST_FORCE_RAW=1` - On Windows, request raw (unprocessed) audio input
+//! - PowerShell: `$env:CPAL_WASAPI_REQUEST_FORCE_RAW = "1"`
+//! - Cmd: `set CPAL_WASAPI_REQUEST_FORCE_RAW=1`
 
 use std::f32::consts::PI;
 use std::io::{self, Write};
@@ -37,7 +39,7 @@ mod config {
     pub const FFT_SIZE: usize = 1024;
     
     /// Number of historical rows to display
-    pub const HISTORY_ROWS: usize = 40;
+    pub const HISTORY_ROWS: usize = 200;
     
     /// UI refresh rate
     pub const REFRESH_INTERVAL: Duration = Duration::from_millis(16);
@@ -290,7 +292,38 @@ mod terminal {
     }
 }
 
-/// Custom FFT implementation using Cooley-Tukey algorithm
+/// Custom FFT implementation of a radix-2 **Cooley–Tukey** Fast Fourier Transform (FFT).
+///
+/// # Overview
+/// This implementation is intentionally **minimal and educational** so that the
+/// example remains free of additional dependencies:
+/// * It accepts *real-valued* input, copies it into a complex buffer (imaginary
+///   part set to `0`) and performs an **in-place** radix-2 decimation-in-time
+///   FFT.
+/// * The computational complexity is `O(N log N)` while the memory footprint
+///   stays at `O(N)` because the supplied output buffer is re-used for the
+///   transform stages.
+///
+/// # Possible improvements
+/// Although perfectly adequate for a small real-time spectrogram, this code is
+/// *not* the fastest nor the most numerically accurate solution.  If you need
+/// more performance consider one (or several) of the following enhancements:
+/// 1. **Drop-in replacement with `rustfft`** – The [`rustfft`](https://docs.rs/rustfft)
+///    crate offers highly optimised SIMD back-ends (AVX, NEON, `simd128` for
+///    WASM) and has been battle-tested in production workloads.
+/// 2. **Cache twiddle factors** – The current inner loop evaluates `sin`/`cos`
+///    every stage.  Pre-computing the twiddle factors for a given FFT size and
+///    re-using them will remove these expensive trigonometric calls.
+/// 3. **Real-to-complex (R2C) or split-radix FFT** – For purely real signals
+///    only the first `N/2 + 1` bins are unique; specialised algorithms can cut
+///    the work (and memory) roughly in half.
+/// 4. **Iterative implementation** – Avoids recursion overhead and eliminates
+///    potential recursion-depth limits on some embedded platforms.
+/// 5. **Parallel or GPU execution** – Large window sizes can be divided across
+///    threads or dispatched to the GPU (OpenCL, CUDA, Vulkan compute, etc.).
+/// 6. **Different window functions & overlap** – Employing Hamming/Blackman
+///    windows and overlapping frames (e.g. 50 % overlap) produces smoother and
+///    more accurate spectrograms.
 mod fft {
     use std::f32::consts::PI;
     
@@ -340,6 +373,9 @@ mod fft {
         }
         
         // Bit reversal
+        // Put the input sequence into *bit-reversed* order.  After this step
+        // the butterfly operations that follow access contiguous memory which
+        // is cache-friendly and simplifies the indexing logic.
         let mut j = 0;
         for i in 1..n {
             let mut bit = n >> 1;
@@ -355,6 +391,10 @@ mod fft {
         }
         
         // Cooley-Tukey FFT
+        // After each outer loop the size of the butterfly (`len`) doubles.  The
+        // `wlen` complex constant is the *principal* twiddle factor for this
+        // stage; successive powers of `wlen` (managed via the accumulator `w`)
+        // rotate around the unit circle to supply the correct phase shifts.
         let mut len = 2;
         while len <= n {
             let angle = 2.0 * PI / len as f32 * if inverse { 1.0 } else { -1.0 };
