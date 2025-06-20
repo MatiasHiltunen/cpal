@@ -16,7 +16,7 @@
 //! - `CPAL_WASAPI_REQUEST_FORCE_RAW=1` - On Windows, request raw (unprocessed) audio input
 
 use std::f32::consts::PI;
-use std::io::{self, stdout, Write};
+use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,8 +35,12 @@ mod config {
     /// Number of historical rows to display
     pub const HISTORY_ROWS: usize = 40;
     
-    /// UI refresh rate
-    pub const REFRESH_INTERVAL: Duration = Duration::from_millis(16);
+    /// UI refresh rate (slower on Windows to reduce flickering)
+    #[cfg(windows)]
+    pub const REFRESH_INTERVAL: Duration = Duration::from_millis(33); // ~30 FPS on Windows
+    
+    #[cfg(not(windows))]
+    pub const REFRESH_INTERVAL: Duration = Duration::from_millis(16); // ~60 FPS on other platforms
     
     /// How often to push a new spectrogram row
     pub const ROW_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
@@ -53,7 +57,7 @@ mod config {
 
 /// Cross-platform terminal control using ANSI escape sequences
 mod terminal {
-    use std::io::{self, Write};
+    use std::io;
 
     /// Enable raw mode (platform-specific)
     pub fn enable_raw_mode() -> io::Result<()> {
@@ -73,17 +77,26 @@ mod terminal {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            use std::ptr;
             
             unsafe {
                 let handle = io::stdin().as_raw_handle();
                 let mut mode = 0;
                 
+                #[repr(C)]
+                struct COORD {
+                    x: i16,
+                    y: i16,
+                }
+                
                 #[link(name = "kernel32")]
                 extern "system" {
                     fn GetConsoleMode(handle: *mut std::ffi::c_void, mode: *mut u32) -> i32;
                     fn SetConsoleMode(handle: *mut std::ffi::c_void, mode: u32) -> i32;
+                    fn GetStdHandle(handle_type: i32) -> *mut std::ffi::c_void;
+                    fn SetConsoleScreenBufferSize(handle: *mut std::ffi::c_void, size: COORD) -> i32;
                 }
+                
+                const STD_OUTPUT_HANDLE: i32 = -11;
                 
                 GetConsoleMode(handle as *mut _, &mut mode);
                 // Disable ENABLE_LINE_INPUT and ENABLE_ECHO_INPUT
@@ -92,11 +105,16 @@ mod terminal {
                 mode |= 0x0004;
                 SetConsoleMode(handle as *mut _, mode);
                 
-                // Enable ANSI escape sequences on stdout
-                let stdout_handle = io::stdout().as_raw_handle();
-                GetConsoleMode(stdout_handle as *mut _, &mut mode);
+                // Enable ANSI escape sequences and optimizations on stdout
+                let stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+                GetConsoleMode(stdout_handle, &mut mode);
                 mode |= 0x0004; // ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                SetConsoleMode(stdout_handle as *mut _, mode);
+                mode |= 0x0008; // ENABLE_DISABLE_NEWLINE_AUTO_RETURN
+                SetConsoleMode(stdout_handle, mode);
+                
+                // Set larger buffer size to reduce flickering
+                let (width, height) = size()?;
+                SetConsoleScreenBufferSize(stdout_handle, COORD { x: width as i16, y: (height * 2) as i16 });
             }
         }
         
@@ -155,12 +173,26 @@ mod terminal {
             
             unsafe {
                 #[repr(C)]
+                struct COORD {
+                    x: i16,
+                    y: i16,
+                }
+                
+                #[repr(C)]
+                struct SMALL_RECT {
+                    left: i16,
+                    top: i16,
+                    right: i16,
+                    bottom: i16,
+                }
+                
+                #[repr(C)]
                 struct CONSOLE_SCREEN_BUFFER_INFO {
-                    size: (i16, i16),
-                    cursor_pos: (i16, i16),
+                    size: COORD,
+                    cursor_pos: COORD,
                     attributes: u16,
-                    window: (i16, i16, i16, i16),
-                    max_window_size: (i16, i16),
+                    window: SMALL_RECT,
+                    max_window_size: COORD,
                 }
                 
                 #[link(name = "kernel32")]
@@ -175,8 +207,8 @@ mod terminal {
                 let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
                 
                 if GetConsoleScreenBufferInfo(handle as *mut _, &mut info) != 0 {
-                    let width = info.window.2 - info.window.0 + 1;
-                    let height = info.window.3 - info.window.1 + 1;
+                    let width = info.window.right - info.window.left + 1;
+                    let height = info.window.bottom - info.window.top + 1;
                     Ok((width as u16, height as u16))
                 } else {
                     Ok((80, 24)) // Default fallback
@@ -269,6 +301,7 @@ mod terminal {
     pub const ALTERNATE_SCREEN: &str = "\x1b[?1049h";
     pub const NORMAL_SCREEN: &str = "\x1b[?1049l";
     pub const RESET_COLOR: &str = "\x1b[0m";
+    pub const CLEAR_LINE: &str = "\x1b[2K";
     
     pub fn move_cursor(x: u16, y: u16) -> String {
         format!("\x1b[{};{}H", y + 1, x + 1)
@@ -276,6 +309,10 @@ mod terminal {
     
     pub fn set_color(r: u8, g: u8, b: u8) -> String {
         format!("\x1b[38;2;{};{};{}m", r, g, b)
+    }
+    
+    pub fn clear_to_end() -> &'static str {
+        "\x1b[0J"
     }
 }
 
@@ -605,27 +642,62 @@ impl SpectrogramDisplay {
         self.history.push(row);
     }
     
-    fn render(&self) -> String {
-        let mut output = String::new();
+    fn render(&self, full_redraw: bool) -> String {
+        let mut output = String::with_capacity(self.current_bins * self.max_rows * 20);
         
-        // Clear screen and move to home
-        output.push_str(terminal::CLEAR_SCREEN);
-        output.push_str(terminal::CURSOR_HOME);
+        if full_redraw {
+            // Only clear screen on full redraw
+            output.push_str(terminal::CLEAR_SCREEN);
+            output.push_str(terminal::CURSOR_HOME);
+            
+            // Title
+            output.push_str("Audio Spectrogram (Press 'q' or ESC to quit)");
+            output.push_str(terminal::CLEAR_LINE);
+            output.push_str("\r\n");
+            
+            output.push_str(&"-".repeat(self.current_bins.min(80)));
+            output.push_str(terminal::CLEAR_LINE);
+            output.push_str("\r\n");
+        } else {
+            // For incremental updates, just move to start of spectrogram area
+            output.push_str(&terminal::move_cursor(0, 2));
+        }
         
-        // Title
-        output.push_str("Audio Spectrogram (Press 'q' or ESC to quit)\r\n");
-        output.push_str(&"-".repeat(self.current_bins.min(80)));
-        output.push_str("\r\n");
+        // Pre-allocate color codes for better performance
+        let color_cache: Vec<String> = (0..=255)
+            .map(|i| {
+                let v = i as f32 / 255.0;
+                let (r, g, b) = value_to_rgb(v);
+                terminal::set_color(r, g, b)
+            })
+            .collect();
         
         // Render spectrogram rows (newest at bottom)
-        for row in self.history.iter().rev() {
-            for &value in row.iter() {
-                let (r, g, b) = value_to_rgb(value);
-                output.push_str(&terminal::set_color(r, g, b));
-                output.push('█');
+        for (row_idx, row) in self.history.iter().rev().enumerate() {
+            if !full_redraw && row_idx < self.history.len() - 1 {
+                // Skip rendering unchanged rows
+                output.push_str("\r\n");
+                continue;
             }
+            
+            // Pre-build the entire row to minimize syscalls
+            let mut row_buffer = String::with_capacity(row.len() * 20);
+            
+            for &value in row.iter() {
+                let color_idx = (value.clamp(0.0, 1.0) * 255.0) as usize;
+                row_buffer.push_str(&color_cache[color_idx]);
+                row_buffer.push('█');
+            }
+            
+            output.push_str(&row_buffer);
             output.push_str(terminal::RESET_COLOR);
+            output.push_str(terminal::CLEAR_LINE);
             output.push_str("\r\n");
+        }
+        
+        // Clear any remaining lines
+        if full_redraw {
+            output.push_str(terminal::clear_to_end());
         }
         
         output
@@ -659,15 +731,85 @@ struct TerminalUI;
 impl TerminalUI {
     fn setup() -> io::Result<()> {
         terminal::enable_raw_mode()?;
-        print!("{}{}", terminal::ALTERNATE_SCREEN, terminal::HIDE_CURSOR);
-        io::stdout().flush()?;
+        
+        // Use a single write for initialization
+        let init_sequence = format!(
+            "{}{}{}",
+            terminal::ALTERNATE_SCREEN,
+            terminal::HIDE_CURSOR,
+            terminal::CLEAR_SCREEN
+        );
+        
+        #[cfg(windows)]
+        {
+            // Direct console write on Windows for better performance
+            unsafe {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn WriteConsoleA(
+                        handle: *mut std::ffi::c_void,
+                        buffer: *const u8,
+                        chars_to_write: u32,
+                        chars_written: *mut u32,
+                        reserved: *mut std::ffi::c_void
+                    ) -> i32;
+                    fn GetStdHandle(handle_type: i32) -> *mut std::ffi::c_void;
+                }
+                
+                const STD_OUTPUT_HANDLE: i32 = -11;
+                let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+                let bytes = init_sequence.as_bytes();
+                let mut written = 0u32;
+                WriteConsoleA(handle, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut());
+            }
+        }
+        
+        #[cfg(not(windows))]
+        {
+            print!("{}", init_sequence);
+            io::stdout().flush()?;
+        }
+        
         Ok(())
     }
     
     fn cleanup() {
         let _ = terminal::disable_raw_mode();
-        print!("{}{}{}", terminal::NORMAL_SCREEN, terminal::SHOW_CURSOR, terminal::RESET_COLOR);
-        let _ = io::stdout().flush();
+        let cleanup_sequence = format!(
+            "{}{}{}",
+            terminal::NORMAL_SCREEN,
+            terminal::SHOW_CURSOR,
+            terminal::RESET_COLOR
+        );
+        
+        #[cfg(windows)]
+        {
+            unsafe {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn WriteConsoleA(
+                        handle: *mut std::ffi::c_void,
+                        buffer: *const u8,
+                        chars_to_write: u32,
+                        chars_written: *mut u32,
+                        reserved: *mut std::ffi::c_void
+                    ) -> i32;
+                    fn GetStdHandle(handle_type: i32) -> *mut std::ffi::c_void;
+                }
+                
+                const STD_OUTPUT_HANDLE: i32 = -11;
+                let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+                let bytes = cleanup_sequence.as_bytes();
+                let mut written = 0u32;
+                WriteConsoleA(handle, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut());
+            }
+        }
+        
+        #[cfg(not(windows))]
+        {
+            print!("{}", cleanup_sequence);
+            let _ = io::stdout().flush();
+        }
     }
 }
 
@@ -711,24 +853,45 @@ impl SpectrogramApp {
         self.audio_capture.start()?;
         
         let mut last_render = Instant::now();
+        let mut last_width = 0u16;
+        let mut needs_full_redraw = true;
+        
+        // Double buffer for flicker-free rendering on Windows
+        let mut render_buffer = String::with_capacity(1024 * 64);
         
         loop {
+            // Check terminal size changes
+            let (current_width, _) = terminal::size()?;
+            if current_width != last_width {
+                last_width = current_width;
+                needs_full_redraw = true;
+            }
+            
             // Process audio samples
+            let mut updated = false;
             while let Ok(sample) = self.audio_capture.try_recv() {
                 if let Some(magnitudes) = self.fft_analyzer.add_sample(sample) {
-                    let (width, _) = terminal::size()?;
-                    
                     let mut display = self.display.lock().unwrap();
-                    display.update(&magnitudes, width as usize);
+                    if display.update(&magnitudes, current_width as usize) {
+                        updated = true;
+                    }
                 }
             }
             
-            // Render at refresh interval
-            if last_render.elapsed() >= config::REFRESH_INTERVAL {
+            // Render at refresh interval or if updated
+            if (last_render.elapsed() >= config::REFRESH_INTERVAL && updated) || needs_full_redraw {
                 let display = self.display.lock().unwrap();
-                print!("{}", display.render());
+                
+                // Build entire frame in buffer first
+                render_buffer.clear();
+                render_buffer.push_str(&display.render(needs_full_redraw));
+                
+                // Single write to stdout for flicker-free rendering
+                print!("{}", render_buffer);
                 io::stdout().flush()?;
+                
                 last_render = Instant::now();
+                needs_full_redraw = false;
             }
             
             // Check for quit key
