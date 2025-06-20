@@ -23,10 +23,6 @@ anyhow = "1.0"
 hound = "3.5"
 ringbuf = "0.4.1"
 clap = { version = "4.0", features = ["derive"] }
-crossterm = "0.27"
-ratatui = { version = "0.22", default-features = false, features = ["crossterm"] }
-rustfft = { version = "6" }
-ctrlc = "3.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.54.0", features = [
