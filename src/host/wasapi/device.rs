@@ -1033,6 +1033,6 @@ static REQUEST_FORCE_RAW: OnceLock<bool> = OnceLock::new();
 #[inline]
 fn force_raw_enabled() -> bool {
     *REQUEST_FORCE_RAW.get_or_init(|| {
-        std::env::var("CPAL_WASAPI_REQUEST_FORCE_RAW").map_or(false, |v| v != "0")
+        std::env::var("CPAL_WASAPI_REQUEST_FORCE_RAW").is_ok_and(|v| v != "0")
     })
 }

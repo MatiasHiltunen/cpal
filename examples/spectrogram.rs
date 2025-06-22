@@ -169,12 +169,14 @@ mod terminal {
             use std::os::windows::io::AsRawHandle;
             
             unsafe {
+                #[allow(non_camel_case_types)]
                 #[repr(C)]
                 struct COORD {
                     x: i16,
                     y: i16,
                 }
-                
+
+                #[allow(non_camel_case_types)]
                 #[repr(C)]
                 struct SMALL_RECT {
                     left: i16,
@@ -183,6 +185,7 @@ mod terminal {
                     bottom: i16,
                 }
                 
+                #[allow(non_camel_case_types)]
                 #[repr(C)]
                 struct CONSOLE_SCREEN_BUFFER_INFO {
                     size: COORD,
@@ -260,6 +263,7 @@ mod terminal {
                     ) -> i32;
                 }
                 
+                #[allow(non_camel_case_types)]
                 #[repr(C)]
                 struct INPUT_RECORD {
                     event_type: u16,
