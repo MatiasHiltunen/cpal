@@ -1,4 +1,4 @@
-//! Production-grade peer-to-peer VoIP example using Opus compression over UDP.
+//! peer-to-peer VoIP example using Opus compression over UDP.
 //!
 //! Features:
 //! - Automatic codec parameter optimization based on network conditions
