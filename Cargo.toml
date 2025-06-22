@@ -23,6 +23,7 @@ anyhow = "1.0"
 hound = "3.5"
 ringbuf = "0.4.1"
 clap = { version = "4.0", features = ["derive"] }
+audiopus = { version = "0.2", default-features = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.54.0", features = [
