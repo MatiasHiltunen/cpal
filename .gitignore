@@ -6,3 +6,4 @@ recorded.wav
 rls*.log
 target
 build
+*.bin
