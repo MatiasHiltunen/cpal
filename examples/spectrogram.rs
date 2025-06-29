@@ -18,12 +18,13 @@
 //! - Cmd: `set CPAL_WASAPI_REQUEST_FORCE_RAW=1`
 
 use std::f32::consts::PI;
-use std::io::{self, Write};
+use std::io::{self, Write, BufWriter};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::fs::File;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
@@ -574,6 +575,54 @@ impl FftAnalyzer {
     }
 }
 
+/// Recorder that writes spectrogram rows to an efficient binary file together
+/// with their relative timestamps.
+struct SpectrogramRecorder {
+    writer: BufWriter<File>,
+    start_time: Instant,
+}
+
+impl SpectrogramRecorder {
+    /// Create a new recorder writing to `path`. The file will be overwritten.
+    fn new<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
+        let file = File::create(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            start_time: Instant::now(),
+        })
+    }
+
+    /// Write a single spectrogram row.
+    ///
+    /// Each row is encoded as:
+    /// * `u64` – microseconds elapsed since the recorder was created (little-endian)
+    /// * `u16` – number of magnitude bins in this row (little-endian)
+    /// * `bins * f32` – raw magnitude values (little-endian)
+    fn write_row(&mut self, timestamp: Instant, bins: &[f32]) -> io::Result<()> {
+        let elapsed = timestamp.duration_since(self.start_time);
+        let micros = elapsed.as_micros() as u64;
+        self.writer.write_all(&micros.to_le_bytes())?;
+
+        let len = bins.len() as u16;
+        self.writer.write_all(&len.to_le_bytes())?;
+
+        for &v in bins {
+            self.writer.write_all(&v.to_le_bytes())?;
+        }
+
+        // Ensure data is persisted incrementally.
+        self.writer.flush()?;
+
+        Ok(())
+    }
+}
+
+impl Drop for SpectrogramRecorder {
+    fn drop(&mut self) {
+        let _ = self.writer.flush();
+    }
+}
+
 /// Spectrogram display
 struct SpectrogramDisplay {
     history: Vec<Vec<f32>>,
@@ -596,7 +645,7 @@ impl SpectrogramDisplay {
         }
     }
     
-    fn update(&mut self, magnitudes: &[f32], terminal_width: usize, terminal_height: usize) -> bool {
+    fn update(&mut self, magnitudes: &[f32], terminal_width: usize, terminal_height: usize) -> Option<Vec<f32>> {
         // Update dimensions if changed
         if terminal_width != self.current_bins && terminal_width > 0 {
             self.resize(terminal_width);
@@ -631,12 +680,13 @@ impl SpectrogramDisplay {
             || self.history.is_empty();
         
         if should_update {
-            self.add_row(self.interval_maximums.clone());
+            let row = self.interval_maximums.clone();
+            self.add_row(row.clone());
             self.interval_maximums.fill(0.0);
             self.last_row_time = Instant::now();
-            true
+            Some(row)
         } else {
-            false
+            None
         }
     }
     
@@ -788,6 +838,7 @@ struct SpectrogramApp {
     audio_capture: AudioCapture,
     fft_analyzer: FftAnalyzer,
     display: Arc<Mutex<SpectrogramDisplay>>,
+    recorder: Option<SpectrogramRecorder>,
     _ui: TerminalUI,
 }
 
@@ -796,6 +847,21 @@ impl SpectrogramApp {
         TerminalUI::setup()?;
         let _ui = TerminalUI;
         
+        // Parse CLI arguments for optional recording path
+        let mut recorder: Option<SpectrogramRecorder> = None;
+        {
+            let mut args = std::env::args().skip(1);
+            while let Some(arg) = args.next() {
+                if arg == "--record" || arg == "-o" {
+                    if let Some(path) = args.next() {
+                        recorder = Some(SpectrogramRecorder::new(path)?);
+                    } else {
+                        return Err("Missing file path after --record/-o".into());
+                    }
+                }
+            }
+        }
+
         let audio_capture = AudioCapture::new()?;
         let fft_analyzer = FftAnalyzer::new(config::FFT_SIZE);
         
@@ -813,6 +879,7 @@ impl SpectrogramApp {
             audio_capture,
             fft_analyzer,
             display,
+            recorder,
             _ui,
         })
     }
@@ -833,8 +900,16 @@ impl SpectrogramApp {
                 if let Some(magnitudes) = self.fft_analyzer.add_sample(sample) {
                     let (width, height) = terminal::size()?;
                     
-                    let mut display = self.display.lock().unwrap();
-                    display.update(&magnitudes, width as usize, height as usize);
+                    let new_row = {
+                        let mut display = self.display.lock().unwrap();
+                        display.update(&magnitudes, width as usize, height as usize)
+                    };
+
+                    if let Some(row) = new_row {
+                        if let Some(rec) = self.recorder.as_mut() {
+                            rec.write_row(Instant::now(), &row)?;
+                        }
+                    }
                 }
             }
             
