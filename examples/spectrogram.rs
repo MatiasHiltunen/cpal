@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::fs::File;
+use std::path::PathBuf;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
@@ -456,10 +457,14 @@ struct AudioCapture {
 impl AudioCapture {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or("No input device found")?;
         
+        // Find an input device
+        let device = host.default_input_device()
+            .or_else(|| host.input_devices().ok()?.next())
+            .ok_or("No input device found")?;
+            
+        println!("Using input device: {}", device.name()?);
+
         let supported_config = device.default_input_config()?;
         let config: StreamConfig = supported_config.config();
         let sample_format = supported_config.sample_format();
@@ -849,16 +854,12 @@ impl SpectrogramApp {
         
         // Parse CLI arguments for optional recording path
         let mut recorder: Option<SpectrogramRecorder> = None;
-        {
-            let mut args = std::env::args().skip(1);
-            while let Some(arg) = args.next() {
-                if arg == "--record" || arg == "-o" {
-                    if let Some(path) = args.next() {
-                        recorder = Some(SpectrogramRecorder::new(path)?);
-                    } else {
-                        return Err("Missing file path after --record/-o".into());
-                    }
-                }
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(pos) = args.iter().position(|a| a == "--record" || a == "-o") {
+            if let Some(path) = args.get(pos + 1).map(PathBuf::from) {
+                recorder = Some(SpectrogramRecorder::new(path)?);
+            } else {
+                return Err("Missing file path after --record/-o".into());
             }
         }
 
